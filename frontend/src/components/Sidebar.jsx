@@ -3,7 +3,7 @@ function Sidebar() {
     <div className="w-64 h-screen bg-slate-950 border-r border-slate-800 p-5 overflow-y-auto">
 
       <h1 className="text-3xl font-bold text-cyan-400">
-        CryptoAI
+        CryptoIQ
       </h1>
 
       <ul className="mt-10 space-y-6 text-gray-300">
