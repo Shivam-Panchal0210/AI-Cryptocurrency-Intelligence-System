@@ -1,131 +1,105 @@
-// backend/server.js
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-require('dotenv').config();
+require('dotenv').config()
+const express    = require('express')
+const http       = require('http')
+const cors       = require('cors')
+const helmet     = require('helmet')
+const morgan     = require('morgan')
+const rateLimit  = require('express-rate-limit')
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_key';
+const connectDB  = require('./config/db')
+const { initWebSocket } = require('./services/websocketService')
+const { startAlertCron } = require('./services/alertService')
 
-app.use(cors({ origin: FRONTEND_URL }));
-app.use(express.json());
+const authRoutes      = require('./routes/auth')
+const userRoutes      = require('./routes/user')
+const portfolioRoutes = require('./routes/portfolio')
+const alertRoutes     = require('./routes/alerts')
+const marketRoutes    = require('./routes/market')
+const watchlistRoutes = require('./routes/watchlist')
 
-// ─── MEMORY STORAGE ─────────────────────────────────────────────────────────
-const users = []; 
-const watchlists = {}; 
-let marketCache = null;
-let lastMarketFetch = 0;
-const MARKET_CACHE_MS = 3000;
+const app    = express()
+const server = http.createServer(app)
 
-const COIN_NAMES = {
-  BTC: 'Bitcoin', ETH: 'Ethereum', BNB: 'BNB', SOL: 'Solana', XRP: 'Ripple',
-  ADA: 'Cardano', DOGE: 'Dogecoin', SHIB: 'Shiba Inu', DOT: 'Polkadot', AVAX: 'Avalanche'
-};
+// ─── Security & middleware ────────────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      connectSrc: ["'self'", "ws://localhost:5000", "wss://localhost:5000", "https://api.binance.com", "wss://stream.binance.com:9443"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com"],
+      imgSrc: ["'self'", "data:", "https://*.binance.com"]
+    }
+  }
+}))
 
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; 
-  if (!token) return res.status(401).json({ success: false, message: 'Token missing.' });
+app.use(cors({
+  origin:      process.env.CLIENT_URL || 'http://localhost:5173',
+  credentials: true,
+}))
+app.use(express.json({ limit: '10kb' }))
+app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'))
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ success: false, message: 'Invalid token.' });
-    req.user = user; 
-    next();
-  });
-};
+// ─── Global rate limiter ──────────────────────────────────────────────────────
+app.use('/api/', rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  max: 200,
+  message: { error: 'Too many requests, please try again later.' },
+}))
 
-// ─── AUTH ROUTES ─────────────────────────────────────────────────────────────
-app.post('/api/auth/register', async (req, res) => {
+// ─── Health check ─────────────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({
+  status: 'ok',
+  uptime: process.uptime(),
+  timestamp: new Date().toISOString(),
+}))
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+app.use('/api/auth',      authRoutes)
+app.use('/api/user',      userRoutes)
+app.use('/api/portfolio', portfolioRoutes)
+app.use('/api/alerts',    alertRoutes)
+
+// FIXED: Mounted specifically to /api/markets (PLURAL) to match frontend requests
+app.use('/api/markets',   marketRoutes) 
+
+app.use('/api/watchlist', watchlistRoutes)
+
+// ─── 404 handler ─────────────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: `Route ${req.originalUrl} not found` }))
+
+// ─── Global error handler ─────────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error('❌ Error:', err.message)
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal server error',
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+  })
+})
+
+// ─── Managed Async App Boot Sequence ──────────────────────────────────────────
+const PORT = process.env.PORT || 5000
+
+async function startServer() {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ success: false, message: 'Fields missing.' });
-    const userExists = users.find(u => u.email === email.toLowerCase());
-    if (userExists) return res.status(409).json({ success: false, message: 'User exists.' });
-
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-    const newUser = { id: Date.now().toString(), email: email.toLowerCase(), password: hashedPassword };
-    users.push(newUser);
-    watchlists[newUser.id] = [];
-    res.status(201).json({ success: true });
-  } catch (error) { res.status(500).json({ success: false }); }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = users.find(u => u.email === email.toLowerCase());
-    if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials.' });
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) return res.status(401).json({ success: false, message: 'Invalid credentials.' });
-
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ success: true, token, user: { id: user.id, email: user.email } });
-  } catch (error) { res.status(500).json({ success: false }); }
-});
-
-// ─── DATA ROUTES FOR YOUR FRONTEND COMPONENTS ────────────────────────────────
-
-// 1. Markets Table Data
-app.get('/api/markets', async (req, res) => {
-  const now = Date.now();
-  if (marketCache && (now - lastMarketFetch < MARKET_CACHE_MS)) return res.json({ success: true, data: marketCache });
-  try {
-    const response = await axios.get('https://api.binance.com/api/v3/ticker/24hr', { timeout: 5000 });
-    const filtered = response.data.filter(item => item.symbol.endsWith('USDT') && !item.symbol.includes('UP') && !item.symbol.includes('DOWN'));
+    // 1. Establish database connection FIRST (Fixes the Alert Cron Error)
+    await connectDB()
     
-    const formattedData = filtered.map((item, index) => {
-      const baseAsset = item.symbol.replace('USDT', '');
-      return { 
-        id: item.symbol.toLowerCase(), 
-        rank: (index + 1).toString(), 
-        symbol: baseAsset, 
-        name: COIN_NAMES[baseAsset] || baseAsset, 
-        priceUsd: item.lastPrice, 
-        changePercent24Hr: item.priceChangePercent,
-        // 👇 Here is the newly added missing data 👇
-        highPrice: item.highPrice,
-        lowPrice: item.lowPrice,
-        volumeUsd24Hr: item.quoteVolume 
-      };
-    });
-    
-    marketCache = formattedData; lastMarketFetch = now;
-    res.json({ success: true, data: formattedData });
-  } catch (error) { res.status(502).json({ success: false }); }
-});
+    // 2. Fire up your WebSocket Gateway + Alert Cron Workers ONLY AFTER DB is ready
+    initWebSocket(server)
+    startAlertCron()
 
-// 2. Chart Candlestick Data
-app.get('/api/klines', async (req, res) => {
-  try {
-    const { symbol = 'BTC', interval = '1d', limit = '40' } = req.query;
-    let sym = symbol.toUpperCase();
-    if (!sym.endsWith('USDT')) sym = `${sym}USDT`;
+    // 3. Open API HTTP Port listeners
+    server.listen(PORT, () => {
+      console.log(`🚀 CryptoAI backend running on port ${PORT}`)
+      console.log(`📡 WebSocket ready`)
+      console.log(`🌍 Environment: ${process.env.NODE_ENV}`)
+    })
+  } catch (error) {
+    console.error('❌ Critical system boot crash:', error.message)
+    process.exit(1)
+  }
+}
 
-    const response = await axios.get('https://api.binance.com/api/v3/klines', {
-      params: { symbol: sym, interval, limit }
-    });
-    const standardCandles = response.data.map(c => ({
-      time: c[0], open: parseFloat(c[1]), high: parseFloat(c[2]), low: parseFloat(c[3]), close: parseFloat(c[4]), volume: parseFloat(c[5])
-    }));
-    res.json({ success: true, data: standardCandles });
-  } catch (error) { res.status(500).json({ success: false }); }
-});
-
-// 3. Fear & Greed Index Data
-app.get('/api/fear-greed', async (req, res) => {
-  try {
-    const response = await axios.get('https://alternative.me/fng/?limit=1');
-    const payload = response.data.data[0];
-    res.json({
-      success: true,
-      data: { value: parseInt(payload.value), sentiment: payload.value_classification, timestamp: payload.timestamp }
-    });
-  } catch (error) { res.status(502).json({ success: false }); }
-});
-
-app.listen(PORT, () => console.log(`🚀 Server fully operational on port ${PORT}`));
+// Boot the system
+startServer()

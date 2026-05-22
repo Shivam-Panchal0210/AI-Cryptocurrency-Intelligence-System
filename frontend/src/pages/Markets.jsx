@@ -1,14 +1,13 @@
-// frontend/src/pages/Markets.jsx
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import OrderBook from '../components/OrderBook'
 import RecentTrades from '../components/RecentTrades'
+import useCryptoStore from '../store/useCryptoStore'
 
 const API_BASE = 'http://localhost:5000/api'
 const PER_PAGE = 10
 const MAIN_COINS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ADA', 'DOGE', 'SHIB', 'DOT', 'AVAX']
 const CRYPTOCOMPARE_API_KEY = '769b4d81ef2e9bf6e9f650da89ad04e597833cec375c8f1c51ee097aaaec4ef0'
 
-// ─── Configuration for Names and Symbols ────────────────────────────────────
 const CURRENCY_FULL_NAMES = {
   USD: 'USD - United States Dollar', EUR: 'EUR - Euro', GBP: 'GBP - British Pound',
   INR: 'INR - Indian Rupee', JPY: 'JPY - Japanese Yen', CAD: 'CAD - Canadian Dollar',
@@ -21,7 +20,6 @@ const SYMBOL_MAP = {
   CAD: '$', AUD: '$', CHF: 'Fr', CNY: '¥', BRL: 'R$'
 };
 
-// ─── Sparkline Graph Component ────────────────────────────────────────────────
 const Sparkline = ({ change }) => {
   const pts = Array.from({ length: 20 }, (_, i) => {
     const trend = change >= 0 ? i * 1.5 : (19 - i) * 1.5
@@ -49,7 +47,6 @@ const Sparkline = ({ change }) => {
   )
 }
 
-// ─── News Container Component ────────────────────────────────────────────────
 const NewsContainer = ({ news }) => {
   const [hoveredId, setHoveredId] = useState(null);
   return (
@@ -86,7 +83,6 @@ const CATEGORIES = [
   { id: 'stablecoin', label: 'Stablecoins'      },
 ]
 
-// ─── Formatting Logic (Updated for Symbols) ──────────────────────────────────
 const fmtPrice = (n, cur = 'USD', rate = 1) => {
   const v = parseFloat(n) * rate
   const symbol = SYMBOL_MAP[cur] || cur
@@ -118,10 +114,9 @@ export default function Markets() {
   const [sortBy,          setSortBy]          = useState('rank')
   const [sortDir,         setSortDir]         = useState('asc')
   const [page,            setPage]            = useState(1)
-  const [selectedSym,     setSelectedSym]     = useState('btcusdt')
+  const [selectedSym,     setSelectedSym]     = useState('BTC')
   const [selectedLabel,   setSelectedLabel]   = useState('BTC')
   const [news,            setNews]            = useState([])
-  
   const [currency,        setCurrency]        = useState('USD')
   const [fxRates,         setFxRates]         = useState({ USD: 1 })
   const [currencyList,    setCurrencyList]    = useState(['USD', 'EUR', 'GBP', 'INR', 'JPY', 'CAD', 'AUD'])
@@ -169,8 +164,31 @@ export default function Markets() {
     try {
       const res = await fetch(`${API_BASE}/markets`, { signal: abortRef.current.signal })
       if (!res.ok) throw new Error("Backend failure.")
-      const json = await res.json()
-      if (json.success) setCoins(json.data)
+      
+      const rawData = await res.json()
+      
+      const formattedData = rawData.map((item, index) => {
+        const sym = (item.symbol || item.s).replace('USDT', '');
+        return {
+          id: item.symbol || item.s,
+          rank: index + 1,
+          name: sym,
+          symbol: sym,
+          priceUsd: parseFloat(item.lastPrice || item.c || 0),
+          changePercent24Hr: parseFloat(item.priceChangePercent || item.P || 0),
+          highPrice: parseFloat(item.highPrice || item.h || 0),
+          lowPrice: parseFloat(item.lowPrice || item.l || 0),
+          volumeUsd24Hr: parseFloat(item.quoteVolume || item.q || 0)
+        }
+      })
+
+      setCoins(formattedData)
+      
+      // Update global store
+      const priceMap = {};
+      formattedData.forEach(c => priceMap[c.symbol] = { price: c.priceUsd, change24h: c.changePercent24Hr });
+      useCryptoStore.getState().setPrices(priceMap);
+
     } catch (err) {
       if (err.name !== 'AbortError') setError(`Failed: ${err.message}`)
     } finally {
@@ -267,7 +285,6 @@ export default function Markets() {
         ))}
       </div>
 
-      {/* Restored Search Bar */}
       <div className="markets-controls" style={{ marginBottom: 16 }}>
         <input className="search-input" placeholder="🔍 Search assets..." value={search} onChange={e => setSearch(e.target.value)} 
           style={{ width: '100%', padding: '12px', borderRadius: 8, background: '#0f172a', border: '1px solid #334155', color: '#fff' }} />
@@ -296,7 +313,7 @@ export default function Markets() {
                 <tr key={coin.id} className="market-row" onClick={() => { setSelectedSym(coin.id); setSelectedLabel(coin.symbol) }}>
                   <td onClick={(e) => toggleWatchlist(e, coin.symbol)} style={{ textAlign: 'center', color: isStarred ? '#ffb300' : '#475569' }}>{isStarred ? '★' : '☆'}</td>
                   <td>{index + 1 + (page - 1) * PER_PAGE}</td>
-                  <td>{coin.name} ({coin.symbol})</td>
+                  <td>{coin.name}</td> {/* Fixed Double Name Issue */}
                   <td>{fmtPrice(coin.priceUsd, currency, rate)}</td>
                   <td style={{ color: chg >= 0 ? '#00f5a0' : '#ff4d6d' }}>{chg.toFixed(2)}%</td>
                   <td>{fmtPrice(coin.highPrice, currency, rate)}</td>
